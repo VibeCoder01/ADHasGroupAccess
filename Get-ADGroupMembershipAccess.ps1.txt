@@ -1,0 +1,90 @@
+Import-Module ActiveDirectory
+
+# Current user token SIDs (user + all groups in token)
+$me = [System.Security.Principal.WindowsIdentity]::GetCurrent()
+$tokenSids = @($me.User.Value) + @($me.Groups | ForEach-Object { $_.Value })
+
+# GUID for the "member" attribute in AD schema
+$memberAttrGuid = [Guid]"bf9679c0-0de6-11d0-a285-00aa003049e2"
+
+# Optional: restrict scope for performance (set to an OU DN if desired)
+$searchBase = (Get-ADDomain).DistinguishedName
+
+$results =
+Get-ADGroup -Filter * -SearchBase $searchBase -Properties DistinguishedName, GroupScope, GroupCategory |
+ForEach-Object {
+
+    $dn = $_.DistinguishedName
+    $hasAccess = $false
+    $reason = $null
+
+    try {
+        # Read security descriptor directly via LDAP
+        $sdObj = Get-ADObject -Identity $dn -Properties nTSecurityDescriptor
+        $sd = $sdObj.nTSecurityDescriptor
+
+        if (-not $sd) {
+            return [pscustomobject]@{
+                GroupName     = $_.Name
+                GroupScope    = $_.GroupScope
+                GroupCategory = $_.GroupCategory
+                HasAccess     = $false
+                Reason        = "NoSecurityDescriptor"
+                DN            = $dn
+            }
+        }
+
+        $acl = $sd.GetAccessRules($true, $true, [System.Security.Principal.SecurityIdentifier])
+    }
+    catch {
+        return [pscustomobject]@{
+            GroupName     = $_.Name
+            GroupScope    = $_.GroupScope
+            GroupCategory = $_.GroupCategory
+            HasAccess     = $false
+            Reason        = "ReadError"
+            DN            = $dn
+        }
+    }
+
+    foreach ($ace in $acl) {
+        if ($ace.AccessControlType -ne 'Allow') { continue }
+
+        $sid = $ace.IdentityReference.Value
+        if ($tokenSids -notcontains $sid) { continue }
+
+        $rights = $ace.ActiveDirectoryRights
+
+        if ($rights.HasFlag([DirectoryServices.ActiveDirectoryRights]::GenericAll)) {
+            $hasAccess = $true; $reason = "GenericAll"; break
+        }
+        if ($rights.HasFlag([DirectoryServices.ActiveDirectoryRights]::GenericWrite)) {
+            $hasAccess = $true; $reason = "GenericWrite"; break
+        }
+        if ($rights.HasFlag([DirectoryServices.ActiveDirectoryRights]::WriteDacl)) {
+            $hasAccess = $true; $reason = "WriteDacl"; break
+        }
+        if ($rights.HasFlag([DirectoryServices.ActiveDirectoryRights]::WriteOwner)) {
+            $hasAccess = $true; $reason = "WriteOwner"; break
+        }
+
+        if ($rights.HasFlag([DirectoryServices.ActiveDirectoryRights]::WriteProperty)) {
+            if ($ace.ObjectType -eq $memberAttrGuid -or $ace.ObjectType -eq [Guid]::Empty) {
+                $hasAccess = $true; $reason = "WriteProperty(member)"; break
+            }
+        }
+    }
+
+    [pscustomobject]@{
+        GroupName     = $_.Name
+        GroupScope    = $_.GroupScope
+        GroupCategory = $_.GroupCategory
+        HasAccess     = $hasAccess
+        Reason        = $reason
+        DN            = $dn
+    }
+}
+
+$results |
+Sort-Object -Property @{ Expression = 'HasAccess'; Descending = $true }, GroupName |
+Out-GridView -Title "AD Groups: Membership Management Access (HasAccess=True/False)"
